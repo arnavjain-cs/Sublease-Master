@@ -11,7 +11,7 @@ npm install
 npm run dev
 ```
 
-Open <http://127.0.0.1:5173>. The API runs on port 3001 and stores data in `data/sublease-master.sqlite`. Development mode seeds four clearly marked sample listings. Sample listings cannot receive inquiries. Local photos are stored in `public/uploads/`.
+Open <http://127.0.0.1:5173>. The API runs on port 3001 and stores data in `data/sublease-master.sqlite`. The app seeds ten clearly marked fictional listings across UT Austin, Rice, and six other universities. Sample listings cannot receive inquiries. Local photos are stored in `public/uploads/`.
 
 Copy `.env.example` to `.env` to customize settings. With no `.env`, local development uses a **demo listing checkout**, so publishing collects no real money. Verification codes appear on the verification page in development when SMTP is not configured. The demo checkout and on-page codes are disabled in production.
 
@@ -39,7 +39,7 @@ The project includes `vercel.json`: Vercel builds the Vite site into `dist/`, ro
 4. Add SMTP variables (`SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`) for school-email verification. Add `PAYMENTS_MODE=stripe`, `STRIPE_SECRET_KEY`, and `STRIPE_WEBHOOK_SECRET` to collect the **$25 per listing** fee. Set `APP_ORIGIN` to your final `https://` domain in production for Stripe return URLs; leave it unset in previews to use each preview's Vercel URL. Configure Stripe's `checkout.session.completed` webhook at `https://YOUR-DOMAIN/api/webhooks/stripe`.
 5. Deploy from your Git repository or with the Vercel CLI, then check `/api/health`, sign up with a school email, upload a photo, and complete a Stripe test-mode checkout. Redeploy after changing environment variables.
 
-Do not set `PAYMENTS_MODE=demo` in production: demo checkout is disabled there. Without Stripe, students can save drafts but cannot publish. Without SMTP, signup is unavailable. The Vercel database starts empty; the four local sample listings are development-only. Local `data/` and `public/uploads/` are excluded from deployment, and existing local records are not automatically transferred to Turso.
+Do not set `PAYMENTS_MODE=demo` in production: demo checkout is disabled there. Without Stripe, students can save drafts but cannot publish. Without SMTP, signup is unavailable. A new Vercel database is populated with the same ten fictional sample listings; their dates move to the next summer as needed. Set `SEED_DEMO=false` to disable them. Local `data/` and `public/uploads/` are excluded from deployment, and existing local records are not automatically transferred to Turso.
 
 ## Other production hosting
 

@@ -3,6 +3,7 @@ import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createClient } from '@libsql/client/http';
+import { sampleListings } from './sample-listings.js';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const dataDir = path.resolve(projectRoot, process.env.DATA_DIR || 'data');
@@ -197,48 +198,45 @@ export async function decorateListing(row) {
   };
 }
 
-export async function seedDemo() {
-  if (process.env.SEED_DEMO === 'false' || process.env.NODE_ENV === 'production') return;
-  await db.prepare("UPDATE listing_photos SET path = REPLACE(path, '.png', '.jpg') WHERE listing_id LIKE 'demo-%' AND path LIKE '/images/%.png'").run();
-  const count = (await db.prepare('SELECT COUNT(*) AS count FROM listings').get()).count;
-  if (count > 0) return;
+export async function seedDemo(now = new Date()) {
+  if (process.env.SEED_DEMO === 'false') return;
+  const examples = sampleListings(now);
+  const rows = await db.prepare(`SELECT l.id, l.title, l.description, l.approval_status, l.available_from, l.available_to,
+    p.id AS photo_id, p.path AS photo_path FROM listings l
+    LEFT JOIN listing_photos p ON p.id = l.id || '-photo' WHERE l.is_demo = 1`).all();
+  const existing = new Map(rows.map((row) => [row.id, row]));
+  const current = examples.every((item) => {
+    const row = existing.get(item.id);
+    return row && row.title === item.title && row.description === item.description &&
+      row.approval_status === item.approval && row.available_from === item.from &&
+      row.available_to === item.to && row.photo_path === item.photo;
+  });
+  if (current) return;
 
   const ownerId = 'demo-owner';
   await db.prepare('INSERT OR IGNORE INTO users (id, name, email, password_hash, school, verified_at) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)')
     .run(ownerId, 'Sublease Master Demo', 'demo@subleasemaster.example', 'disabled', 'Demo campuses');
 
-  const examples = [
-    {
-      id: 'demo-evanston', title: 'Sunlit room near campus', description: 'A comfortable private room in a quiet shared apartment. The room has a desk, generous natural light, and easy access to campus. This is a sample listing for exploring the app.',
-      school: 'Northwestern University', city: 'Evanston', region: 'IL', neighborhood: 'Downtown Evanston', rent: 98000, utilities: 6500, deposit: 0,
-      from: '2027-05-20', to: '2027-08-20', type: 'private_room', beds: 3, baths: 2, roommates: 2, furnished: 1, approval: 'requested', amenities: ['Wi-Fi', 'In-unit laundry', 'Desk', 'Air conditioning'], photo: '/images/room-olive.jpg',
-    },
-    {
-      id: 'demo-boston', title: 'Bright studio for the summer', description: 'A bright, compact studio with a small kitchen and room to work from home. Walkable to transit and neighborhood cafés. This is a sample listing for exploring the app.',
-      school: 'Boston University', city: 'Boston', region: 'MA', neighborhood: 'Allston', rent: 165000, utilities: 8000, deposit: 0,
-      from: '2027-06-01', to: '2027-08-31', type: 'entire_place', beds: 1, baths: 1, roommates: 0, furnished: 1, approval: 'approved', amenities: ['Wi-Fi', 'Furnished', 'Near transit'], photo: '/images/studio-sunlit.jpg',
-    },
-    {
-      id: 'demo-ann-arbor', title: 'Calm bedroom by the Diag', description: 'A private room with a workspace in a well-kept student apartment. Convenient for summer classes and internships nearby. This is a sample listing for exploring the app.',
-      school: 'University of Michigan', city: 'Ann Arbor', region: 'MI', neighborhood: 'Central Campus', rent: 87500, utilities: 5000, deposit: 0,
-      from: '2027-05-15', to: '2027-08-15', type: 'private_room', beds: 4, baths: 2, roommates: 3, furnished: 1, approval: 'not_started', amenities: ['Desk', 'Laundry', 'Dishwasher'], photo: '/images/room-blue.jpg',
-    },
-    {
-      id: 'demo-austin', title: 'Open, airy room in West Campus', description: 'Private bedroom in a shared apartment with a practical layout and lots of afternoon light. Close to campus and local bus lines. This is a sample listing for exploring the app.',
-      school: 'University of Texas at Austin', city: 'Austin', region: 'TX', neighborhood: 'West Campus', rent: 112500, utilities: 7000, deposit: 0,
-      from: '2027-05-25', to: '2027-08-10', type: 'private_room', beds: 3, baths: 2, roommates: 2, furnished: 1, approval: 'requested', amenities: ['Balcony', 'Wi-Fi', 'In-unit laundry'], photo: '/images/hero-apartment.jpg',
-    },
-  ];
-
-  const insert = db.prepare(`INSERT INTO listings (id, owner_id, title, description, school, city, region, neighborhood,
+  const insert = db.prepare(`INSERT OR IGNORE INTO listings (id, owner_id, title, description, school, city, region, neighborhood,
     rent_cents, utilities_cents, deposit_cents, available_from, available_to, room_type, bedrooms, bathrooms,
     roommates, furnished, approval_status, amenities_json, status, paid_at, is_demo)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'published', CURRENT_TIMESTAMP, 1)`);
-  const insertPhoto = db.prepare('INSERT INTO listing_photos (id, listing_id, path, sort_order) VALUES (?, ?, ?, 0)');
+  const updateSample = db.prepare(`UPDATE listings SET title = ?, description = ?, approval_status = ?,
+    available_from = ?, available_to = ? WHERE id = ? AND is_demo = 1`);
+  const insertPhoto = db.prepare('INSERT OR IGNORE INTO listing_photos (id, listing_id, path, sort_order) VALUES (?, ?, ?, 0)');
+  const updatePhoto = db.prepare('UPDATE listing_photos SET path = ? WHERE id = ? AND listing_id = ?');
   for (const item of examples) {
     await insert.run(item.id, ownerId, item.title, item.description, item.school, item.city, item.region, item.neighborhood,
       item.rent, item.utilities, item.deposit, item.from, item.to, item.type, item.beds, item.baths, item.roommates,
       item.furnished, item.approval, JSON.stringify(item.amenities));
+    const row = existing.get(item.id);
+    if (row && (row.title !== item.title || row.description !== item.description ||
+      row.approval_status !== item.approval || row.available_from !== item.from || row.available_to !== item.to)) {
+      await updateSample.run(item.title, item.description, item.approval, item.from, item.to, item.id);
+    }
     await insertPhoto.run(`${item.id}-photo`, item.id, item.photo);
+    if (row?.photo_id && row.photo_path !== item.photo) {
+      await updatePhoto.run(item.photo, `${item.id}-photo`, item.id);
+    }
   }
 }

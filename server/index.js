@@ -182,7 +182,8 @@ app.post('/api/auth/resend', authThrottle, requireUser, async (req, res) => {
 
 app.get('/api/schools', async (req, res) => {
   const q = String(req.query.q || '').trim();
-  const rows = await db.prepare(`SELECT DISTINCT school FROM listings WHERE status = 'published' AND school LIKE ? ORDER BY school LIMIT 30`).all(`%${q}%`);
+  const rows = await db.prepare(`SELECT school FROM listings WHERE status = 'published' AND school LIKE ?
+    GROUP BY school ORDER BY COUNT(*) DESC, school LIMIT 30`).all(`%${q}%`);
   res.json({ schools: rows.map((row) => row.school) });
 });
 
@@ -206,7 +207,7 @@ app.get('/api/listings', async (req, res) => {
   if (['private_room', 'shared_room', 'entire_place'].includes(req.query.roomType)) {
     where.push('l.room_type = ?'); params.push(req.query.roomType);
   }
-  const sort = { newest: 'l.created_at DESC', price_asc: 'l.rent_cents ASC', price_desc: 'l.rent_cents DESC' }[req.query.sort] || 'l.created_at DESC';
+  const sort = { newest: 'l.created_at DESC, l.rowid DESC', price_asc: 'l.rent_cents ASC, l.rowid DESC', price_desc: 'l.rent_cents DESC, l.rowid DESC' }[req.query.sort] || 'l.created_at DESC, l.rowid DESC';
   const page = Math.max(1, Math.min(100, Number.parseInt(req.query.page, 10) || 1));
   const limit = 12;
   const clause = where.join(' AND ');
