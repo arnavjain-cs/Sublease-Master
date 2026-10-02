@@ -2,15 +2,35 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createClient } from '@libsql/client/http';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const dataDir = path.resolve(projectRoot, process.env.DATA_DIR || 'data');
-mkdirSync(dataDir, { recursive: true });
+const remoteUrl = process.env.TURSO_DATABASE_URL;
+if (process.env.VERCEL && (!remoteUrl || !process.env.TURSO_AUTH_TOKEN)) {
+  throw new Error('TURSO_DATABASE_URL and TURSO_AUTH_TOKEN are required on Vercel.');
+}
+if (!remoteUrl) mkdirSync(dataDir, { recursive: true });
 
-export const db = new DatabaseSync(path.join(dataDir, 'sublease-master.sqlite'));
-db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
+const localDb = remoteUrl ? null : new DatabaseSync(path.join(dataDir, 'sublease-master.sqlite'));
+const remoteDb = remoteUrl ? createClient({ url: remoteUrl, authToken: process.env.TURSO_AUTH_TOKEN }) : null;
+if (localDb) localDb.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
 
-db.exec(`
+// Keep local SQLite fast and compatible with existing data, while using durable
+// remote SQLite for serverless deployments. Callers await either implementation.
+export const db = {
+  prepare(sql) {
+    if (localDb) return localDb.prepare(sql);
+    const query = (...args) => remoteDb.execute({ sql, args });
+    return {
+      async get(...args) { return (await query(...args)).rows[0] || null; },
+      async all(...args) { return (await query(...args)).rows; },
+      async run(...args) { return query(...args); },
+    };
+  },
+};
+
+const schema = `
   CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -110,7 +130,15 @@ db.exec(`
     status TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   );
-`);
+`;
+
+if (localDb) localDb.exec(schema);
+else {
+  // Schema creation is idempotent, so every cold start can safely initialize.
+  for (const statement of schema.split(';').map((part) => part.trim()).filter(Boolean)) {
+    await remoteDb.execute(statement);
+  }
+}
 
 export function publicUser(user) {
   if (!user) return null;
@@ -124,8 +152,8 @@ export function publicUser(user) {
   };
 }
 
-export function listingById(id) {
-  const row = db.prepare(`
+export async function listingById(id) {
+  const row = await db.prepare(`
     SELECT l.*, u.name AS owner_name, u.school AS owner_school,
       (SELECT COUNT(*) FROM threads t WHERE t.listing_id = l.id) AS inquiry_count
     FROM listings l JOIN users u ON u.id = l.owner_id WHERE l.id = ?
@@ -133,8 +161,8 @@ export function listingById(id) {
   return row ? decorateListing(row) : null;
 }
 
-export function decorateListing(row) {
-  const photoDetails = db.prepare('SELECT id, path FROM listing_photos WHERE listing_id = ? ORDER BY sort_order').all(row.id);
+export async function decorateListing(row) {
+  const photoDetails = await db.prepare('SELECT id, path FROM listing_photos WHERE listing_id = ? ORDER BY sort_order').all(row.id);
   return {
     id: row.id,
     ownerId: row.owner_id,
@@ -169,14 +197,14 @@ export function decorateListing(row) {
   };
 }
 
-export function seedDemo() {
+export async function seedDemo() {
   if (process.env.SEED_DEMO === 'false' || process.env.NODE_ENV === 'production') return;
-  db.prepare("UPDATE listing_photos SET path = REPLACE(path, '.png', '.jpg') WHERE listing_id LIKE 'demo-%' AND path LIKE '/images/%.png'").run();
-  const count = db.prepare('SELECT COUNT(*) AS count FROM listings').get().count;
+  await db.prepare("UPDATE listing_photos SET path = REPLACE(path, '.png', '.jpg') WHERE listing_id LIKE 'demo-%' AND path LIKE '/images/%.png'").run();
+  const count = (await db.prepare('SELECT COUNT(*) AS count FROM listings').get()).count;
   if (count > 0) return;
 
   const ownerId = 'demo-owner';
-  db.prepare('INSERT OR IGNORE INTO users (id, name, email, password_hash, school, verified_at) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)')
+  await db.prepare('INSERT OR IGNORE INTO users (id, name, email, password_hash, school, verified_at) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)')
     .run(ownerId, 'Sublease Master Demo', 'demo@subleasemaster.example', 'disabled', 'Demo campuses');
 
   const examples = [
@@ -208,9 +236,9 @@ export function seedDemo() {
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'published', CURRENT_TIMESTAMP, 1)`);
   const insertPhoto = db.prepare('INSERT INTO listing_photos (id, listing_id, path, sort_order) VALUES (?, ?, ?, 0)');
   for (const item of examples) {
-    insert.run(item.id, ownerId, item.title, item.description, item.school, item.city, item.region, item.neighborhood,
+    await insert.run(item.id, ownerId, item.title, item.description, item.school, item.city, item.region, item.neighborhood,
       item.rent, item.utilities, item.deposit, item.from, item.to, item.type, item.beds, item.baths, item.roommates,
       item.furnished, item.approval, JSON.stringify(item.amenities));
-    insertPhoto.run(`${item.id}-photo`, item.id, item.photo);
+    await insertPhoto.run(`${item.id}-photo`, item.id, item.photo);
   }
 }

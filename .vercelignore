@@ -1,0 +1,7 @@
+.env
+data/
+public/uploads/
+tmp/
+output/
+node_modules/
+dist/

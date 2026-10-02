@@ -2,6 +2,7 @@ import express from 'express';
 import multer from 'multer';
 import nodemailer from 'nodemailer';
 import Stripe from 'stripe';
+import { put, del } from '@vercel/blob';
 import { randomInt, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, writeFileSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
@@ -12,12 +13,12 @@ import { academicEmail, inquirySchema, listingSchema, loginSchema, messageSchema
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const uploadDir = path.resolve(projectRoot, process.env.UPLOAD_DIR || 'public/uploads');
-mkdirSync(uploadDir, { recursive: true });
-seedDemo();
+if (!process.env.VERCEL) mkdirSync(uploadDir, { recursive: true });
+await seedDemo();
 
 const app = express();
 const port = Number(process.env.PORT || 3001);
-const origin = process.env.APP_ORIGIN || 'http://127.0.0.1:5173';
+const origin = process.env.APP_ORIGIN || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : 'http://127.0.0.1:5173');
 const requestedPaymentsMode = process.env.PAYMENTS_MODE || (process.env.NODE_ENV === 'production' ? 'disabled' : 'demo');
 const paymentsMode = requestedPaymentsMode === 'demo' && process.env.NODE_ENV === 'production' ? 'disabled' : requestedPaymentsMode;
 const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
@@ -34,25 +35,25 @@ function sendError(res, status, message, extra = {}) {
   return res.status(status).json({ error: message, ...extra });
 }
 
-function markStripeCheckoutPaid(session) {
+async function markStripeCheckoutPaid(session) {
   const listingId = session.metadata?.listingId;
   const userId = session.metadata?.userId;
   if (session.payment_status !== 'paid' || session.amount_total !== 2500 || session.currency !== 'usd' || !listingId || !userId) return false;
-  const listing = db.prepare('SELECT id, owner_id, paid_at FROM listings WHERE id = ?').get(listingId);
+  const listing = await db.prepare('SELECT id, owner_id, paid_at FROM listings WHERE id = ?').get(listingId);
   if (!listing || listing.owner_id !== userId) return false;
-  db.prepare(`UPDATE listings SET status = CASE WHEN paid_at IS NULL THEN 'published' ELSE status END,
+  await db.prepare(`UPDATE listings SET status = CASE WHEN paid_at IS NULL THEN 'published' ELSE status END,
     paid_at = COALESCE(paid_at, CURRENT_TIMESTAMP), updated_at = CURRENT_TIMESTAMP WHERE id = ?`).run(listingId);
-  db.prepare("UPDATE payments SET status = 'paid' WHERE stripe_session_id = ?").run(session.id);
-  db.prepare(`INSERT OR IGNORE INTO payments (id, listing_id, user_id, stripe_session_id, amount_cents, status) VALUES (?, ?, ?, ?, 2500, 'paid')`)
+  await db.prepare("UPDATE payments SET status = 'paid' WHERE stripe_session_id = ?").run(session.id);
+  await db.prepare(`INSERT OR IGNORE INTO payments (id, listing_id, user_id, stripe_session_id, amount_cents, status) VALUES (?, ?, ?, ?, 2500, 'paid')`)
     .run(randomUUID(), listingId, userId, session.id);
   return true;
 }
 
-app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), (req, res) => {
+app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
   if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) return sendError(res, 503, 'Stripe webhooks are not configured.');
   try {
     const event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], process.env.STRIPE_WEBHOOK_SECRET);
-    if (event.type === 'checkout.session.completed') markStripeCheckoutPaid(event.data.object);
+    if (event.type === 'checkout.session.completed') await markStripeCheckoutPaid(event.data.object);
     res.json({ received: true });
   } catch (error) {
     sendError(res, 400, `Webhook rejected: ${error.message}`);
@@ -60,7 +61,7 @@ app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), (req
 });
 
 app.use(express.json({ limit: '1mb' }));
-app.use('/uploads', express.static(uploadDir, { immutable: true, maxAge: '1y' }));
+if (!process.env.VERCEL) app.use('/uploads', express.static(uploadDir, { immutable: true, maxAge: '1y' }));
 app.use(attachUser);
 
 // Same-origin cookies protect sessions; this also rejects foreign browser POSTs.
@@ -90,7 +91,7 @@ function authThrottle(req, res, next) {
 async function issueVerification(user) {
   const code = String(randomInt(100000, 999999));
   const expiresAt = new Date(Date.now() + 15 * 60_000).toISOString();
-  db.prepare(`INSERT INTO verification_codes (user_id, code_hash, expires_at, attempts) VALUES (?, ?, ?, 0)
+  await db.prepare(`INSERT INTO verification_codes (user_id, code_hash, expires_at, attempts) VALUES (?, ?, ?, 0)
     ON CONFLICT(user_id) DO UPDATE SET code_hash = excluded.code_hash, expires_at = excluded.expires_at, attempts = 0`)
     .run(user.id, hash(`${user.id}:${code}`), expiresAt);
 
@@ -113,13 +114,13 @@ async function issueVerification(user) {
   return code;
 }
 
-app.get('/api/health', (_req, res) => res.json({ ok: true }));
-app.get('/api/config', (_req, res) => res.json({
+app.get('/api/health', async (_req, res) => res.json({ ok: true }));
+app.get('/api/config', async (_req, res) => res.json({
   listingPrice: 25,
   paymentsMode: paymentsMode === 'demo' ? 'demo' : paymentsMode === 'stripe' && stripe ? 'stripe' : 'unavailable',
   rentPaymentsAvailable: false,
 }));
-app.get('/api/auth/me', (req, res) => res.json(userResponse(req.user)));
+app.get('/api/auth/me', async (req, res) => res.json(userResponse(req.user)));
 
 app.post('/api/auth/signup', authThrottle, async (req, res) => {
   const parsed = signupSchema.safeParse(req.body);
@@ -127,45 +128,45 @@ app.post('/api/auth/signup', authThrottle, async (req, res) => {
   const { name, email, password, school } = parsed.data;
   if (!academicEmail(email)) return sendError(res, 400, 'Use a school email address. Contact us if your college uses an uncommon domain.', { fields: { email: 'A school email is required.' } });
   if (process.env.NODE_ENV === 'production' && !process.env.SMTP_HOST) return sendError(res, 503, 'Email verification is temporarily unavailable.');
-  if (db.prepare('SELECT id FROM users WHERE email = ?').get(email)) return sendError(res, 409, 'An account with that email already exists.');
+  if (await db.prepare('SELECT id FROM users WHERE email = ?').get(email)) return sendError(res, 409, 'An account with that email already exists.');
   const id = randomUUID();
-  db.prepare('INSERT INTO users (id, name, email, password_hash, school) VALUES (?, ?, ?, ?, ?)').run(id, name, email, hashPassword(password), school);
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
+  await db.prepare('INSERT INTO users (id, name, email, password_hash, school) VALUES (?, ?, ?, ?, ?)').run(id, name, email, hashPassword(password), school);
+  const user = await db.prepare('SELECT * FROM users WHERE id = ?').get(id);
   try {
     const devCode = await issueVerification(user);
-    createSession(res, id);
+    await createSession(res, id);
     res.status(201).json({ ...userResponse(user), devCode });
   } catch (error) {
-    db.prepare('DELETE FROM users WHERE id = ?').run(id);
+    await db.prepare('DELETE FROM users WHERE id = ?').run(id);
     sendError(res, 503, 'We could not send the verification code. Please try again.');
   }
 });
 
-app.post('/api/auth/login', authThrottle, (req, res) => {
+app.post('/api/auth/login', authThrottle, async (req, res) => {
   const parsed = loginSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json(validationError(parsed));
-  const user = db.prepare('SELECT * FROM users WHERE email = ?').get(parsed.data.email);
+  const user = await db.prepare('SELECT * FROM users WHERE email = ?').get(parsed.data.email);
   if (!user || !checkPassword(parsed.data.password, user.password_hash)) return sendError(res, 401, 'Email or password is incorrect.');
-  createSession(res, user.id);
+  await createSession(res, user.id);
   res.json(userResponse(user));
 });
 
-app.post('/api/auth/logout', requireUser, (req, res) => {
-  clearSession(req, res);
+app.post('/api/auth/logout', requireUser, async (req, res) => {
+  await clearSession(req, res);
   res.json({ ok: true });
 });
 
-app.post('/api/auth/verify', authThrottle, requireUser, (req, res) => {
+app.post('/api/auth/verify', authThrottle, requireUser, async (req, res) => {
   const code = String(req.body?.code || '').trim();
   if (!/^\d{6}$/.test(code)) return sendError(res, 400, 'Enter the six-digit code.');
-  const record = db.prepare('SELECT * FROM verification_codes WHERE user_id = ?').get(req.user.id);
+  const record = await db.prepare('SELECT * FROM verification_codes WHERE user_id = ?').get(req.user.id);
   if (!record || new Date(record.expires_at).getTime() < Date.now()) return sendError(res, 400, 'That code expired. Request a new one.');
   if (record.attempts >= 5) return sendError(res, 429, 'Too many attempts. Request a new code.');
-  db.prepare('UPDATE verification_codes SET attempts = attempts + 1 WHERE user_id = ?').run(req.user.id);
+  await db.prepare('UPDATE verification_codes SET attempts = attempts + 1 WHERE user_id = ?').run(req.user.id);
   if (record.code_hash !== hash(`${req.user.id}:${code}`)) return sendError(res, 400, 'The code is incorrect.');
-  db.prepare('UPDATE users SET verified_at = CURRENT_TIMESTAMP WHERE id = ?').run(req.user.id);
-  db.prepare('DELETE FROM verification_codes WHERE user_id = ?').run(req.user.id);
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id);
+  await db.prepare('UPDATE users SET verified_at = CURRENT_TIMESTAMP WHERE id = ?').run(req.user.id);
+  await db.prepare('DELETE FROM verification_codes WHERE user_id = ?').run(req.user.id);
+  const user = await db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id);
   res.json(userResponse(user));
 });
 
@@ -179,13 +180,13 @@ app.post('/api/auth/resend', authThrottle, requireUser, async (req, res) => {
   }
 });
 
-app.get('/api/schools', (req, res) => {
+app.get('/api/schools', async (req, res) => {
   const q = String(req.query.q || '').trim();
-  const rows = db.prepare(`SELECT DISTINCT school FROM listings WHERE status = 'published' AND school LIKE ? ORDER BY school LIMIT 30`).all(`%${q}%`);
+  const rows = await db.prepare(`SELECT DISTINCT school FROM listings WHERE status = 'published' AND school LIKE ? ORDER BY school LIMIT 30`).all(`%${q}%`);
   res.json({ schools: rows.map((row) => row.school) });
 });
 
-app.get('/api/listings', (req, res) => {
+app.get('/api/listings', async (req, res) => {
   const where = ["l.status = 'published'", "l.available_to >= date('now')"];
   const params = [];
   const q = String(req.query.q || '').trim().slice(0, 100);
@@ -209,47 +210,51 @@ app.get('/api/listings', (req, res) => {
   const page = Math.max(1, Math.min(100, Number.parseInt(req.query.page, 10) || 1));
   const limit = 12;
   const clause = where.join(' AND ');
-  const total = db.prepare(`SELECT COUNT(*) AS count FROM listings l WHERE ${clause}`).get(...params).count;
-  const rows = db.prepare(`SELECT l.*, u.name AS owner_name, u.school AS owner_school FROM listings l JOIN users u ON u.id = l.owner_id WHERE ${clause} ORDER BY ${sort} LIMIT ? OFFSET ?`)
+  const total = (await db.prepare(`SELECT COUNT(*) AS count FROM listings l WHERE ${clause}`).get(...params)).count;
+  const rows = await db.prepare(`SELECT l.*, u.name AS owner_name, u.school AS owner_school FROM listings l JOIN users u ON u.id = l.owner_id WHERE ${clause} ORDER BY ${sort} LIMIT ? OFFSET ?`)
     .all(...params, limit, (page - 1) * limit);
-  res.json({ listings: rows.map(decorateListing), total, page, pages: Math.ceil(total / limit) });
+  res.json({ listings: await Promise.all(rows.map(decorateListing)), total, page, pages: Math.ceil(total / limit) });
 });
 
-app.get('/api/listings/:id', (req, res) => {
-  const listing = listingById(req.params.id);
+app.get('/api/listings/:id', async (req, res) => {
+  const listing = await listingById(req.params.id);
   if (!listing || (listing.status !== 'published' && req.user?.id !== listing.ownerId)) return sendError(res, 404, 'Listing not found.');
-  if (listing.status === 'published' && !listing.isDemo) db.prepare('UPDATE listings SET views = views + 1 WHERE id = ?').run(listing.id);
+  if (listing.status === 'published' && !listing.isDemo) await db.prepare('UPDATE listings SET views = views + 1 WHERE id = ?').run(listing.id);
   const owner = req.user?.id === listing.ownerId;
-  res.json({ listing: { ...listing, ...(owner ? { privateAddress: db.prepare('SELECT private_address FROM listings WHERE id = ?').get(listing.id).private_address, photoDetails: db.prepare('SELECT id, path FROM listing_photos WHERE listing_id = ? ORDER BY sort_order').all(listing.id) } : {}) } });
+  const ownerDetails = owner ? {
+    privateAddress: (await db.prepare('SELECT private_address FROM listings WHERE id = ?').get(listing.id)).private_address,
+    photoDetails: await db.prepare('SELECT id, path FROM listing_photos WHERE listing_id = ? ORDER BY sort_order').all(listing.id),
+  } : {};
+  res.json({ listing: { ...listing, ...ownerDetails } });
 });
 
-app.post('/api/listings', requireVerified, (req, res) => {
+app.post('/api/listings', requireVerified, async (req, res) => {
   const parsed = listingSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json(validationError(parsed));
   const v = parsed.data;
   const id = randomUUID();
-  db.prepare(`INSERT INTO listings (id, owner_id, title, description, school, city, region, neighborhood, private_address,
+  await db.prepare(`INSERT INTO listings (id, owner_id, title, description, school, city, region, neighborhood, private_address,
     rent_cents, utilities_cents, deposit_cents, available_from, available_to, room_type, bedrooms, bathrooms, roommates,
     furnished, approval_status, amenities_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .run(id, req.user.id, v.title, v.description, v.school, v.city, v.region, v.neighborhood, v.privateAddress,
       Math.round(v.rent * 100), Math.round(v.utilities * 100), Math.round(v.deposit * 100), v.availableFrom, v.availableTo,
       v.roomType, v.bedrooms, v.bathrooms, v.roommates, Number(v.furnished), v.approvalStatus, JSON.stringify(v.amenities));
-  res.status(201).json({ listing: listingById(id) });
+  res.status(201).json({ listing: await listingById(id) });
 });
 
-app.put('/api/listings/:id', requireVerified, (req, res) => {
-  const original = db.prepare('SELECT * FROM listings WHERE id = ?').get(req.params.id);
+app.put('/api/listings/:id', requireVerified, async (req, res) => {
+  const original = await db.prepare('SELECT * FROM listings WHERE id = ?').get(req.params.id);
   if (!original || original.owner_id !== req.user.id) return sendError(res, 404, 'Listing not found.');
   const parsed = listingSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json(validationError(parsed));
   const v = parsed.data;
-  db.prepare(`UPDATE listings SET title=?, description=?, school=?, city=?, region=?, neighborhood=?, private_address=?,
+  await db.prepare(`UPDATE listings SET title=?, description=?, school=?, city=?, region=?, neighborhood=?, private_address=?,
     rent_cents=?, utilities_cents=?, deposit_cents=?, available_from=?, available_to=?, room_type=?, bedrooms=?, bathrooms=?,
     roommates=?, furnished=?, approval_status=?, amenities_json=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`)
     .run(v.title, v.description, v.school, v.city, v.region, v.neighborhood, v.privateAddress, Math.round(v.rent * 100),
       Math.round(v.utilities * 100), Math.round(v.deposit * 100), v.availableFrom, v.availableTo, v.roomType, v.bedrooms,
       v.bathrooms, v.roommates, Number(v.furnished), v.approvalStatus, JSON.stringify(v.amenities), original.id);
-  res.json({ listing: listingById(original.id) });
+  res.json({ listing: await listingById(original.id) });
 });
 
 function imageExtension(buffer) {
@@ -259,46 +264,61 @@ function imageExtension(buffer) {
   return null;
 }
 
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 6 * 1024 * 1024, files: 5 } });
-app.post('/api/listings/:id/photos', requireVerified, upload.array('photos', 5), (req, res) => {
-  const row = db.prepare('SELECT * FROM listings WHERE id = ?').get(req.params.id);
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 3 * 1024 * 1024, files: 1 } });
+app.post('/api/listings/:id/photos', requireVerified, upload.array('photos', 1), async (req, res) => {
+  const row = await db.prepare('SELECT * FROM listings WHERE id = ?').get(req.params.id);
   if (!row || row.owner_id !== req.user.id) return sendError(res, 404, 'Listing not found.');
-  const existing = db.prepare('SELECT COUNT(*) AS count FROM listing_photos WHERE listing_id = ?').get(row.id).count;
+  const existing = (await db.prepare('SELECT COUNT(*) AS count FROM listing_photos WHERE listing_id = ?').get(row.id)).count;
   if (!req.files?.length) return sendError(res, 400, 'Choose at least one photo.');
   if (existing + req.files.length > 5) return sendError(res, 400, 'Listings can have up to five photos.');
   const extensions = req.files.map((file) => imageExtension(file.buffer));
   if (extensions.some((extension) => !extension)) return sendError(res, 400, 'Only PNG, JPEG, or WebP images are supported.');
+  if (process.env.VERCEL && !process.env.BLOB_READ_WRITE_TOKEN) return sendError(res, 503, 'Photo storage is not configured.');
   for (const [index, file] of req.files.entries()) {
     const extension = extensions[index];
     const fileName = `${randomUUID()}.${extension}`;
-    writeFileSync(path.join(uploadDir, fileName), file.buffer, { flag: 'wx' });
-    db.prepare('INSERT INTO listing_photos (id, listing_id, path, sort_order) VALUES (?, ?, ?, ?)')
-      .run(randomUUID(), row.id, `/uploads/${fileName}`, existing + index);
+    const photoPath = process.env.VERCEL
+      ? (await put(`listing-photos/${row.id}/${fileName}`, file.buffer, {
+          access: 'public', addRandomSuffix: false,
+          contentType: { png: 'image/png', jpg: 'image/jpeg', webp: 'image/webp' }[extension],
+        })).url
+      : `/uploads/${fileName}`;
+    if (!process.env.VERCEL) writeFileSync(path.join(uploadDir, fileName), file.buffer, { flag: 'wx' });
+    try {
+      await db.prepare('INSERT INTO listing_photos (id, listing_id, path, sort_order) VALUES (?, ?, ?, ?)')
+        .run(randomUUID(), row.id, photoPath, existing + index);
+    } catch (error) {
+      if (process.env.VERCEL) await del(photoPath);
+      else unlinkSync(path.join(uploadDir, fileName));
+      throw error;
+    }
   }
-  res.json({ listing: listingById(row.id) });
+  res.json({ listing: await listingById(row.id) });
 });
 
-app.delete('/api/listings/:id/photos/:photoId', requireVerified, (req, res) => {
-  const row = db.prepare(`SELECT p.* FROM listing_photos p JOIN listings l ON l.id = p.listing_id WHERE p.id = ? AND l.id = ? AND l.owner_id = ?`)
+app.delete('/api/listings/:id/photos/:photoId', requireVerified, async (req, res) => {
+  const row = await db.prepare(`SELECT p.* FROM listing_photos p JOIN listings l ON l.id = p.listing_id WHERE p.id = ? AND l.id = ? AND l.owner_id = ?`)
     .get(req.params.photoId, req.params.id, req.user.id);
   if (!row) return sendError(res, 404, 'Photo not found.');
-  db.prepare('DELETE FROM listing_photos WHERE id = ?').run(row.id);
+  await db.prepare('DELETE FROM listing_photos WHERE id = ?').run(row.id);
   if (row.path.startsWith('/uploads/')) {
     const filePath = path.join(uploadDir, path.basename(row.path));
     if (existsSync(filePath)) unlinkSync(filePath);
+  } else if (process.env.VERCEL && row.path.startsWith('https://')) {
+    await del(row.path);
   }
-  res.json({ listing: listingById(req.params.id) });
+  res.json({ listing: await listingById(req.params.id) });
 });
 
 app.post('/api/listings/:id/checkout', requireVerified, async (req, res) => {
-  const row = db.prepare('SELECT * FROM listings WHERE id = ?').get(req.params.id);
+  const row = await db.prepare('SELECT * FROM listings WHERE id = ?').get(req.params.id);
   if (!row || row.owner_id !== req.user.id) return sendError(res, 404, 'Listing not found.');
   if (row.paid_at) return res.json({ redirect: `/rooms/${row.id}` });
-  const photos = db.prepare('SELECT COUNT(*) AS count FROM listing_photos WHERE listing_id = ?').get(row.id).count;
+  const photos = (await db.prepare('SELECT COUNT(*) AS count FROM listing_photos WHERE listing_id = ?').get(row.id)).count;
   if (!photos) return sendError(res, 400, 'Add at least one photo before publishing.');
   if (paymentsMode === 'demo') {
-    db.prepare(`UPDATE listings SET status = 'published', paid_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).run(row.id);
-    db.prepare(`INSERT INTO payments (id, listing_id, user_id, amount_cents, status) VALUES (?, ?, ?, 2500, 'demo')`)
+    await db.prepare(`UPDATE listings SET status = 'published', paid_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).run(row.id);
+    await db.prepare(`INSERT INTO payments (id, listing_id, user_id, amount_cents, status) VALUES (?, ?, ?, 2500, 'demo')`)
       .run(randomUUID(), row.id, req.user.id);
     return res.json({ mode: 'demo', redirect: `/rooms/${row.id}?published=demo` });
   }
@@ -312,7 +332,7 @@ app.post('/api/listings/:id/checkout', requireVerified, async (req, res) => {
     cancel_url: `${origin}/dashboard?checkout=cancelled`,
     metadata: { listingId: row.id, userId: req.user.id },
   });
-  db.prepare(`INSERT INTO payments (id, listing_id, user_id, stripe_session_id, amount_cents, status) VALUES (?, ?, ?, ?, 2500, 'pending')`)
+  await db.prepare(`INSERT INTO payments (id, listing_id, user_id, stripe_session_id, amount_cents, status) VALUES (?, ?, ?, ?, 2500, 'pending')`)
     .run(randomUUID(), row.id, req.user.id, session.id);
   res.json({ mode: 'stripe', url: session.url });
 });
@@ -321,73 +341,73 @@ app.get('/api/payments/confirm', requireUser, async (req, res) => {
   if (!stripe || !req.query.session_id) return sendError(res, 400, 'Checkout session not found.');
   const session = await stripe.checkout.sessions.retrieve(String(req.query.session_id));
   if (session.metadata?.userId !== req.user.id) return sendError(res, 403, 'That checkout belongs to another account.');
-  if (!markStripeCheckoutPaid(session)) return sendError(res, 400, 'Payment has not completed.');
+  if (!await markStripeCheckoutPaid(session)) return sendError(res, 400, 'Payment has not completed.');
   res.json({ listingId: session.metadata.listingId });
 });
 
-app.patch('/api/listings/:id/status', requireVerified, (req, res) => {
-  const row = db.prepare('SELECT * FROM listings WHERE id = ?').get(req.params.id);
+app.patch('/api/listings/:id/status', requireVerified, async (req, res) => {
+  const row = await db.prepare('SELECT * FROM listings WHERE id = ?').get(req.params.id);
   if (!row || row.owner_id !== req.user.id) return sendError(res, 404, 'Listing not found.');
   const status = String(req.body?.status || '');
   if (!['published', 'unavailable', 'archived'].includes(status)) return sendError(res, 400, 'Invalid listing status.');
   if (status === 'published' && !row.paid_at) return sendError(res, 402, 'Complete the $25 listing checkout to publish.');
-  db.prepare('UPDATE listings SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(status, row.id);
-  res.json({ listing: listingById(row.id) });
+  await db.prepare('UPDATE listings SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(status, row.id);
+  res.json({ listing: await listingById(row.id) });
 });
 
-app.get('/api/dashboard', requireUser, (req, res) => {
-  const rows = db.prepare('SELECT l.*, u.name AS owner_name, u.school AS owner_school, (SELECT COUNT(*) FROM threads t WHERE t.listing_id = l.id) AS inquiry_count FROM listings l JOIN users u ON u.id = l.owner_id WHERE l.owner_id = ? ORDER BY l.created_at DESC').all(req.user.id);
-  const inquiries = db.prepare('SELECT COUNT(*) AS count FROM threads WHERE owner_id = ?').get(req.user.id).count;
-  res.json({ listings: rows.map(decorateListing), inquiryCount: inquiries });
+app.get('/api/dashboard', requireUser, async (req, res) => {
+  const rows = await db.prepare('SELECT l.*, u.name AS owner_name, u.school AS owner_school, (SELECT COUNT(*) FROM threads t WHERE t.listing_id = l.id) AS inquiry_count FROM listings l JOIN users u ON u.id = l.owner_id WHERE l.owner_id = ? ORDER BY l.created_at DESC').all(req.user.id);
+  const inquiries = (await db.prepare('SELECT COUNT(*) AS count FROM threads WHERE owner_id = ?').get(req.user.id)).count;
+  res.json({ listings: await Promise.all(rows.map(decorateListing)), inquiryCount: inquiries });
 });
 
-app.get('/api/favorites', requireUser, (req, res) => {
-  const rows = db.prepare(`SELECT l.*, u.name AS owner_name, u.school AS owner_school FROM favorites f
+app.get('/api/favorites', requireUser, async (req, res) => {
+  const rows = await db.prepare(`SELECT l.*, u.name AS owner_name, u.school AS owner_school FROM favorites f
     JOIN listings l ON l.id = f.listing_id JOIN users u ON u.id = l.owner_id WHERE f.user_id = ? AND l.status = 'published' ORDER BY f.created_at DESC`)
     .all(req.user.id);
-  res.json({ listings: rows.map(decorateListing) });
+  res.json({ listings: await Promise.all(rows.map(decorateListing)) });
 });
 
-app.get('/api/favorites/ids', requireUser, (req, res) => {
-  const rows = db.prepare('SELECT listing_id FROM favorites WHERE user_id = ?').all(req.user.id);
+app.get('/api/favorites/ids', requireUser, async (req, res) => {
+  const rows = await db.prepare('SELECT listing_id FROM favorites WHERE user_id = ?').all(req.user.id);
   res.json({ ids: rows.map((row) => row.listing_id) });
 });
 
-app.post('/api/favorites/:id', requireVerified, (req, res) => {
-  const listing = db.prepare("SELECT id FROM listings WHERE id = ? AND status = 'published'").get(req.params.id);
+app.post('/api/favorites/:id', requireVerified, async (req, res) => {
+  const listing = await db.prepare("SELECT id FROM listings WHERE id = ? AND status = 'published'").get(req.params.id);
   if (!listing) return sendError(res, 404, 'Listing not found.');
-  const existing = db.prepare('SELECT 1 FROM favorites WHERE user_id = ? AND listing_id = ?').get(req.user.id, listing.id);
-  if (existing) db.prepare('DELETE FROM favorites WHERE user_id = ? AND listing_id = ?').run(req.user.id, listing.id);
-  else db.prepare('INSERT INTO favorites (user_id, listing_id) VALUES (?, ?)').run(req.user.id, listing.id);
+  const existing = await db.prepare('SELECT 1 FROM favorites WHERE user_id = ? AND listing_id = ?').get(req.user.id, listing.id);
+  if (existing) await db.prepare('DELETE FROM favorites WHERE user_id = ? AND listing_id = ?').run(req.user.id, listing.id);
+  else await db.prepare('INSERT INTO favorites (user_id, listing_id) VALUES (?, ?)').run(req.user.id, listing.id);
   res.json({ saved: !existing });
 });
 
-app.post('/api/inquiries', requireVerified, (req, res) => {
+app.post('/api/inquiries', requireVerified, async (req, res) => {
   const parsed = inquirySchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json(validationError(parsed));
   const v = parsed.data;
-  const listing = db.prepare("SELECT * FROM listings WHERE id = ? AND status = 'published'").get(v.listingId);
+  const listing = await db.prepare("SELECT * FROM listings WHERE id = ? AND status = 'published'").get(v.listingId);
   if (!listing) return sendError(res, 404, 'Listing not found.');
   if (listing.is_demo) return sendError(res, 400, 'This sample listing cannot receive inquiries.');
   if (listing.owner_id === req.user.id) return sendError(res, 400, 'You cannot inquire about your own listing.');
   if (v.requestedFrom && v.requestedFrom < listing.available_from || v.requestedTo && v.requestedTo > listing.available_to) {
     return sendError(res, 400, 'Requested dates must fit within the listed availability.');
   }
-  let thread = db.prepare('SELECT * FROM threads WHERE listing_id = ? AND requester_id = ?').get(listing.id, req.user.id);
+  let thread = await db.prepare('SELECT * FROM threads WHERE listing_id = ? AND requester_id = ?').get(listing.id, req.user.id);
   if (!thread) {
     const id = randomUUID();
-    db.prepare('INSERT INTO threads (id, listing_id, requester_id, owner_id, requested_from, requested_to) VALUES (?, ?, ?, ?, ?, ?)')
+    await db.prepare('INSERT INTO threads (id, listing_id, requester_id, owner_id, requested_from, requested_to) VALUES (?, ?, ?, ?, ?, ?)')
       .run(id, listing.id, req.user.id, listing.owner_id, v.requestedFrom || null, v.requestedTo || null);
     thread = { id };
   }
-  db.prepare('INSERT INTO messages (id, thread_id, sender_id, body) VALUES (?, ?, ?, ?)')
+  await db.prepare('INSERT INTO messages (id, thread_id, sender_id, body) VALUES (?, ?, ?, ?)')
     .run(randomUUID(), thread.id, req.user.id, v.message);
-  db.prepare('UPDATE threads SET updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(thread.id);
+  await db.prepare('UPDATE threads SET updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(thread.id);
   res.status(201).json({ threadId: thread.id });
 });
 
-app.get('/api/threads', requireUser, (req, res) => {
-  const rows = db.prepare(`SELECT t.*, l.title AS listing_title, l.status AS listing_status,
+app.get('/api/threads', requireUser, async (req, res) => {
+  const rows = await db.prepare(`SELECT t.*, l.title AS listing_title, l.status AS listing_status,
     (SELECT path FROM listing_photos WHERE listing_id = t.listing_id ORDER BY sort_order LIMIT 1) AS photo,
     r.name AS requester_name, o.name AS owner_name,
     (SELECT body FROM messages WHERE thread_id = t.id ORDER BY created_at DESC, rowid DESC LIMIT 1) AS last_message
@@ -402,12 +422,12 @@ app.get('/api/threads', requireUser, (req, res) => {
   })) });
 });
 
-app.get('/api/threads/:id', requireUser, (req, res) => {
-  const row = db.prepare(`SELECT t.*, l.title AS listing_title, l.status AS listing_status, r.name AS requester_name, o.name AS owner_name
+app.get('/api/threads/:id', requireUser, async (req, res) => {
+  const row = await db.prepare(`SELECT t.*, l.title AS listing_title, l.status AS listing_status, r.name AS requester_name, o.name AS owner_name
     FROM threads t JOIN listings l ON l.id = t.listing_id JOIN users r ON r.id = t.requester_id
     JOIN users o ON o.id = t.owner_id WHERE t.id = ?`).get(req.params.id);
   if (!row || (row.owner_id !== req.user.id && row.requester_id !== req.user.id)) return sendError(res, 404, 'Conversation not found.');
-  const messages = db.prepare('SELECT m.id, m.body, m.sender_id AS senderId, m.created_at AS createdAt FROM messages m WHERE m.thread_id = ? ORDER BY m.created_at, m.rowid').all(row.id);
+  const messages = await db.prepare('SELECT m.id, m.body, m.sender_id AS senderId, m.created_at AS createdAt FROM messages m WHERE m.thread_id = ? ORDER BY m.created_at, m.rowid').all(row.id);
   res.json({
     thread: { id: row.id, listingId: row.listing_id, listingTitle: row.listing_title, listingStatus: row.listing_status,
       counterpart: req.user.id === row.owner_id ? row.requester_name : row.owner_name, requestedFrom: row.requested_from,
@@ -416,43 +436,39 @@ app.get('/api/threads/:id', requireUser, (req, res) => {
   });
 });
 
-app.post('/api/threads/:id/messages', requireVerified, (req, res) => {
-  const thread = db.prepare('SELECT * FROM threads WHERE id = ?').get(req.params.id);
+app.post('/api/threads/:id/messages', requireVerified, async (req, res) => {
+  const thread = await db.prepare('SELECT * FROM threads WHERE id = ?').get(req.params.id);
   if (!thread || (thread.owner_id !== req.user.id && thread.requester_id !== req.user.id)) return sendError(res, 404, 'Conversation not found.');
   const parsed = messageSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json(validationError(parsed));
   const id = randomUUID();
-  db.prepare('INSERT INTO messages (id, thread_id, sender_id, body) VALUES (?, ?, ?, ?)').run(id, thread.id, req.user.id, parsed.data.body);
-  db.prepare('UPDATE threads SET updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(thread.id);
+  await db.prepare('INSERT INTO messages (id, thread_id, sender_id, body) VALUES (?, ?, ?, ?)').run(id, thread.id, req.user.id, parsed.data.body);
+  await db.prepare('UPDATE threads SET updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(thread.id);
   res.status(201).json({ id });
 });
 
-app.post('/api/listings/:id/report', requireVerified, (req, res) => {
+app.post('/api/listings/:id/report', requireVerified, async (req, res) => {
   const parsed = reportSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json(validationError(parsed));
-  const listing = db.prepare('SELECT * FROM listings WHERE id = ?').get(req.params.id);
+  const listing = await db.prepare('SELECT * FROM listings WHERE id = ?').get(req.params.id);
   if (!listing) return sendError(res, 404, 'Listing not found.');
-  db.prepare('INSERT INTO reports (id, listing_id, reporter_id, reason, details) VALUES (?, ?, ?, ?, ?)')
+  await db.prepare('INSERT INTO reports (id, listing_id, reporter_id, reason, details) VALUES (?, ?, ?, ?, ?)')
     .run(randomUUID(), listing.id, req.user.id, parsed.data.reason, parsed.data.details);
   res.status(201).json({ ok: true });
 });
 
-app.use('/api', (_req, res) => sendError(res, 404, 'This endpoint was not found.'));
+app.use('/api', async (_req, res) => sendError(res, 404, 'This endpoint was not found.'));
 
-if (process.env.NODE_ENV === 'production') {
+if (process.env.NODE_ENV === 'production' && !process.env.VERCEL) {
   const distDir = path.join(projectRoot, 'dist');
   app.use(express.static(distDir, { maxAge: '1h' }));
-  app.use((req, res) => res.sendFile(path.join(distDir, 'index.html')));
+  app.use(async (req, res) => res.sendFile(path.join(distDir, 'index.html')));
 }
 
 app.use((error, _req, res, _next) => {
-  if (error instanceof multer.MulterError) return sendError(res, 400, error.code === 'LIMIT_FILE_SIZE' ? 'Each photo must be under 6 MB.' : 'Photo upload failed.');
+  if (error instanceof multer.MulterError) return sendError(res, 400, error.code === 'LIMIT_FILE_SIZE' ? 'Each photo must be under 3 MB.' : 'Photo upload failed.');
   console.error(error);
   sendError(res, 500, 'Something went wrong. Please try again.');
 });
 
-const host = process.env.HOST || (process.env.NODE_ENV === 'production' ? '0.0.0.0' : '127.0.0.1');
-app.listen(port, host, () => {
-  console.log(`Sublease Master API listening on http://${host}:${port}`);
-  if (paymentsMode === 'demo') console.log('Demo checkout is active. No real money is collected.');
-});
+export default app;

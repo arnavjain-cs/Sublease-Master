@@ -31,19 +31,21 @@ function getCookie(req, name) {
   return null;
 }
 
-export function currentUser(req) {
+export async function currentUser(req) {
   const token = getCookie(req, cookieName);
   if (!token) return null;
-  const row = db.prepare(`
+  const row = await db.prepare(`
     SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id
     WHERE s.token_hash = ? AND datetime(s.expires_at) > CURRENT_TIMESTAMP
   `).get(hash(token));
   return row || null;
 }
 
-export function attachUser(req, _res, next) {
-  req.user = currentUser(req);
-  next();
+export async function attachUser(req, _res, next) {
+  try {
+    req.user = await currentUser(req);
+    next();
+  } catch (error) { next(error); }
 }
 
 export function requireUser(req, res, next) {
@@ -57,10 +59,10 @@ export function requireVerified(req, res, next) {
   next();
 }
 
-export function createSession(res, userId) {
+export async function createSession(res, userId) {
   const token = randomBytes(32).toString('base64url');
   const expiresAt = new Date(Date.now() + sessionDays * 86400_000).toISOString();
-  db.prepare('INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)').run(hash(token), userId, expiresAt);
+  await db.prepare('INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)').run(hash(token), userId, expiresAt);
   res.cookie(cookieName, token, {
     httpOnly: true,
     secure: process.env.NODE_ENV === 'production',
@@ -70,9 +72,9 @@ export function createSession(res, userId) {
   });
 }
 
-export function clearSession(req, res) {
+export async function clearSession(req, res) {
   const token = getCookie(req, cookieName);
-  if (token) db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(hash(token));
+  if (token) await db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(hash(token));
   res.clearCookie(cookieName, { path: '/' });
 }
 

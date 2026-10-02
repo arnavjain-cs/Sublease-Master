@@ -17,10 +17,12 @@
   "dependencies": {
     "@fontsource-variable/dm-sans": "^5.2.7",
     "@fontsource-variable/plus-jakarta-sans": "^5.2.8",
+    "@libsql/client": "^0.18.0",
     "@phosphor-icons/react": "^2.1.7",
+    "@vercel/blob": "^2.8.0",
     "express": "^5.1.0",
     "multer": "^2.0.2",
-    "nodemailer": "^7.0.6",
+    "nodemailer": "^10.0.13",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "react-router-dom": "^7.7.0",
