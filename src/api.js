@@ -1,22 +1,36 @@
+import { demoResponse } from './demo-data';
+
 export async function api(path, options = {}) {
+  const demo = (!options.method || options.method === 'GET') ? demoResponse(path) : null;
+  // A Vercel class-project build can browse sample rooms with no database setup.
+  if (import.meta.env.PROD && demo) return demo;
+
   const isForm = options.body instanceof FormData;
-  const response = await fetch(`/api${path}`, {
-    credentials: 'same-origin',
-    ...options,
-    headers: {
-      ...(isForm ? {} : options.body ? { 'Content-Type': 'application/json' } : {}),
-      ...options.headers,
-    },
-    body: isForm || typeof options.body === 'string' || options.body == null ? options.body : JSON.stringify(options.body),
-  });
+  let response;
+  try {
+    response = await fetch(`/api${path}`, {
+      credentials: 'same-origin',
+      ...options,
+      headers: {
+        ...(isForm ? {} : options.body ? { 'Content-Type': 'application/json' } : {}),
+        ...options.headers,
+      },
+      body: isForm || typeof options.body === 'string' || options.body == null ? options.body : JSON.stringify(options.body),
+    });
+  } catch (error) {
+    if (demo) return demo;
+    throw error;
+  }
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
+    if (demo && response.status >= 500) return demo;
     const error = new Error(data.error || 'Something went wrong. Please try again.');
     error.status = response.status;
     error.fields = data.fields || {};
     error.code = data.code;
     throw error;
   }
+  if (demo && !Object.keys(data).length) return demo;
   return data;
 }
 
